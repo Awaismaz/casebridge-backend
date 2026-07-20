@@ -42,21 +42,27 @@ def my_messages(request):
     thread, _ = Thread.objects.get_or_create(case=case, defaults={"firm_id": case.firm_id})
 
     if request.method == "POST":
+        from casebridge import ai
+
         body = (request.data.get("body") or "").strip()
         if not body:
             return Response({"detail": "Message body required."}, status=400)
+        sent = ai.score_sentiment(body)
         msg = Message.objects_unscoped.create(
             firm_id=case.firm_id,
             thread=thread,
             sender_type=Message.SenderType.CLIENT,
             sender_name=request.user.name,
             body=body,
+            sentiment=sent["sentiment"],
+            sentiment_flagged=sent["flagged"],
         )
         ValueEvent.objects_unscoped.create(
             firm_id=case.firm_id,
             module="portal",
             event_type="client_message_sent",
             actor_type="client",
+            metadata={"sentiment": sent["sentiment"], "flagged": sent["flagged"]},
         )
         return Response(_msg_json(msg), status=201)
 
@@ -179,24 +185,70 @@ def grant_consent(request):
     return Response({"ok": True, "channel": channel, "granted": granted})
 
 
+@api_view(["POST"])
+@permission_classes([IsPortalClient])
+def set_language(request):
+    client = request.user.client
+    lang = request.data.get("preferred_language")
+    if lang not in ("en", "es"):
+        return Response({"detail": "preferred_language must be en|es."}, status=400)
+    client.preferred_language = lang
+    client.save(update_fields=["preferred_language"])
+    return Response({"ok": True, "preferred_language": lang})
+
+
+STAGE_CONTENT = {
+    "en": {
+        "labels": dict(CANONICAL_STAGES),
+        "explainers": {
+            "intake": "We're setting up your case, gathering the basics, and making sure you get the care you need.",
+            "treatment": "Focus on getting better. We track your treatment while you heal — your only job is to follow your doctors' plan.",
+            "records": "We're collecting your medical records and bills from every provider to document the full impact of your injury.",
+            "demand": "We're preparing a demand package that tells your story and presents the evidence to the insurance company.",
+            "negotiation": "We're negotiating with the insurance company to get you the compensation you deserve.",
+            "litigation": "Your case is in litigation. We're fighting for you in court — we'll guide you through every step.",
+            "settlement": "Great news — we're finalizing your settlement, resolving liens, and preparing your disbursement.",
+            "closed": "Your case is complete. Funds have been disbursed. We're here if you ever need us again.",
+        },
+    },
+    "es": {
+        "labels": {
+            "intake": "Inicio del caso", "treatment": "Tratamiento médico",
+            "records": "Reuniendo expedientes", "demand": "Preparación de la demanda",
+            "negotiation": "Negociación", "litigation": "Litigio",
+            "settlement": "Acuerdo", "closed": "Caso cerrado",
+        },
+        "explainers": {
+            "intake": "Estamos abriendo su caso, reuniendo la información básica y asegurándonos de que reciba la atención médica que necesita.",
+            "treatment": "Concéntrese en recuperarse. Damos seguimiento a su tratamiento mientras se recupera; su única tarea es seguir el plan de sus médicos.",
+            "records": "Estamos reuniendo sus expedientes médicos y facturas de cada proveedor para documentar el impacto total de su lesión.",
+            "demand": "Estamos preparando el paquete de demanda que cuenta su historia y presenta la evidencia a la compañía de seguros.",
+            "negotiation": "Estamos negociando con la compañía de seguros para obtener la compensación que usted merece.",
+            "litigation": "Su caso está en litigio. Estamos luchando por usted en la corte y lo guiaremos en cada paso.",
+            "settlement": "Buenas noticias: estamos finalizando su acuerdo, resolviendo gravámenes y preparando su pago.",
+            "closed": "Su caso está completo. Los fondos han sido entregados. Estamos aquí si alguna vez nos necesita de nuevo.",
+        },
+    },
+}
+
+
 @api_view(["GET"])
 @permission_classes([IsPortalClient])
 def stage_reference(request):
-    """The canonical ladder with plain-language explainers for the tracker."""
-    explainers = {
-        "intake": "We're setting up your case, gathering the basics, and making sure you get the care you need.",
-        "treatment": "Focus on getting better. We track your treatment while you heal — your only job is to follow your doctors' plan.",
-        "records": "We're collecting your medical records and bills from every provider to document the full impact of your injury.",
-        "demand": "We're preparing a demand package that tells your story and presents the evidence to the insurance company.",
-        "negotiation": "We're negotiating with the insurance company to get you the compensation you deserve.",
-        "litigation": "Your case is in litigation. We're fighting for you in court — we'll guide you through every step.",
-        "settlement": "Great news — we're finalizing your settlement, resolving liens, and preparing your disbursement.",
-        "closed": "Your case is complete. Funds have been disbursed. We're here if you ever need us again.",
-    }
+    """The canonical ladder with plain-language explainers, in the client's
+    preferred language (Spanish-first supported)."""
+    lang = request.GET.get("lang") or getattr(request.user.client, "preferred_language", "en")
+    content = STAGE_CONTENT.get(lang, STAGE_CONTENT["en"])
     return Response(
         {
+            "lang": lang if lang in STAGE_CONTENT else "en",
             "stages": [
-                {"key": k, "label": label, "explainer": explainers.get(k, ""), "order": i}
+                {
+                    "key": k,
+                    "label": content["labels"].get(k, label),
+                    "explainer": content["explainers"].get(k, ""),
+                    "order": i,
+                }
                 for i, (k, label) in enumerate(CANONICAL_STAGES)
             ],
             "order": STAGE_ORDER,

@@ -33,7 +33,18 @@ class Command(BaseCommand):
     help = "Seed demo firms with realistic data (idempotent)."
 
     def handle(self, *args, **options):
-        for slug in ("zinda-law-group", "coastal-injury-law"):
+        slugs = ("zinda-law-group", "coastal-injury-law")
+        # StaffUser uses on_delete=SET_NULL, so staff survive a firm delete and
+        # collide on re-seed. Delete them first (by firm and by known emails),
+        # then wipe the firms.
+        StaffUser.objects.filter(firm__slug__in=slugs).delete()
+        StaffUser.objects.filter(
+            email__in=[
+                "demo.staff@casebridge.app", "marcus.demo@casebridge.app",
+                "elena.demo@casebridge.app", "pat@coastal-demo.example",
+            ]
+        ).delete()
+        for slug in slugs:
             Firm.objects.filter(slug=slug).delete()
 
         zlg = Firm.objects.create(
@@ -376,6 +387,145 @@ class Command(BaseCommand):
                     actor_type="client" if i % 4 == 0 else "staff",
                     created_at=days_ago(i % 28),
                 )
+
+            # ----------------------------------------------------------
+            # Day-2 additions: sentiment, cadence, SLA, NPS, growth,
+            # templates, narrative, connector, embeddings.
+            # ----------------------------------------------------------
+            from apps.connectors.models import ConnectorConfig
+            from apps.docintel.models import CaseNarrative
+            from apps.engagement.models import GrowthSignal, NpsSurvey, UpdateTemplate
+            from apps.messaging.models import Delivery, ScheduledCheckIn
+            from casebridge import ai
+
+            # A frustrated (negative-sentiment, flagged) client message on the
+            # out-of-cadence DeShawn case → shows in the sentiment review queue.
+            t_deshawn = Thread.objects_unscoped.filter(case=cases[2]).first()
+            if t_deshawn:
+                Message.objects_unscoped.create(
+                    firm=zlg, thread=t_deshawn, sender_type="client",
+                    sender_name=cases[2].client.name,
+                    body="It's been almost two weeks and nobody has called me back. "
+                         "I'm really frustrated and starting to wonder if I picked the wrong firm.",
+                    sentiment="negative", sentiment_flagged=True, created_at=days_ago(1),
+                )
+
+            # SLA: a fast staff reply to a client message on the demo case so
+            # the response-time metric has signal.
+            t_demo = Thread.objects_unscoped.filter(case=demo_case).first()
+
+            # Scheduled check-ins for every open case
+            for c in cases:
+                if c.status == "open":
+                    ScheduledCheckIn.objects_unscoped.create(
+                        firm=zlg, case=c, cadence_days=14,
+                        next_run_at=NOW + timedelta(days=(c.id.int % 10)),
+                        last_run_at=days_ago(7),
+                    )
+
+            # Delivery records on the latest staff message (multi-channel intent)
+            last_staff = Message.objects_unscoped.filter(
+                firm=zlg, thread=thread, sender_type="staff"
+            ).order_by("-created_at").first()
+            if last_staff:
+                for ch, st in [("portal", "delivered"), ("email", "sent"), ("sms", "delivered")]:
+                    Delivery.objects_unscoped.create(
+                        firm=zlg, message=last_staff, channel=ch, status=st,
+                        provider_message_id=f"demo-{ch}-{last_staff.id.hex[:8]}",
+                    )
+
+            # NPS: a promoter (Luis, settlement) and a passive (Grace, closed)
+            NpsSurvey.objects_unscoped.create(
+                firm=zlg, case=cases[6], client=cases[6].client, trigger="settlement",
+                score=10, comment="Sarah kept me informed the whole way. Incredible team.",
+                sent_at=days_ago(3), responded_at=days_ago(2),
+            )
+            NpsSurvey.objects_unscoped.create(
+                firm=zlg, case=cases[7], client=cases[7].client, trigger="settlement",
+                score=8, comment="Good outcome, took a while.", sent_at=days_ago(35),
+                responded_at=days_ago(33),
+            )
+            NpsSurvey.objects_unscoped.create(
+                firm=zlg, case=demo_case, client=demo_client, trigger="stage_move",
+                sent_at=days_ago(1),  # pending — shows the client survey prompt
+            )
+
+            # Growth signals from the promoter
+            GrowthSignal.objects_unscoped.create(
+                firm=zlg, case=cases[6], kind="review",
+                detail="High NPS (10) at settlement — ask for a Google review.",
+            )
+            GrowthSignal.objects_unscoped.create(
+                firm=zlg, case=cases[6], kind="referral",
+                detail="Promoter — natural moment to ask for a referral.",
+            )
+            GrowthSignal.objects_unscoped.create(
+                firm=zlg, case=cases[4], kind="household",
+                detail="Client mentioned a spouse was also in the vehicle — potential claimant.",
+            )
+
+            # Bad-news / proactive update templates
+            for kind, title, body in [
+                ("delay", "Records delay",
+                 "Hi {name}, a quick heads-up: one of your providers is running behind on "
+                 "sending records. We've followed up and expect them shortly — this is normal "
+                 "and doesn't affect the strength of your case. We'll update you the moment they arrive."),
+                ("setback", "Insurance pushback",
+                 "Hi {name}, we want to be upfront: the insurance company came back lower than "
+                 "your case is worth. That's a common opening move. We're preparing a strong "
+                 "counter and will walk you through the numbers this week."),
+                ("milestone", "Good news",
+                 "Great news, {name}! Your case just moved forward. Here's what it means for you "
+                 "and what happens next."),
+                ("request", "We need something from you",
+                 "Hi {name}, to keep your case moving we need one quick thing from you. "
+                 "You can upload it right in the portal under Documents."),
+            ]:
+                UpdateTemplate.objects_unscoped.create(
+                    firm=zlg, kind=kind, title=title, body=body,
+                )
+
+            # Case narrative for the demo case (assembled from timeline)
+            _events = [
+                {"date": days_ago(210).date().isoformat(), "title": "Accident on I-35",
+                 "description": "Rear-end collision"},
+                {"date": days_ago(30).date().isoformat(), "title": "Demand package sent",
+                 "description": "Delivered to State Farm"},
+                {"date": days_ago(2).date().isoformat(), "title": "Initial offer received",
+                 "description": "Under review"},
+            ]
+            _nar = ai.generate_narrative(demo_case.title, "Negotiation", _events)
+            CaseNarrative.objects_unscoped.create(
+                firm=zlg, case=demo_case, text=_nar["text"], ai_generated=_nar["ai"],
+                version=1, generated_at=NOW,
+            )
+
+            # Connector config (enabled, PM source, stage map) + a couple of
+            # applied inbound events so the connector status page has signal.
+            ConnectorConfig.objects.create(
+                firm=zlg, source="pm", enabled=True,
+                shared_secret="demo-shared-secret-zlg",
+                stage_map={".5V": "intake", "2MM": "records", "3DP": "demand",
+                           "4NG": "negotiation", "6SF": "settlement"},
+                last_event_at=days_ago(0, 3),
+            )
+            from apps.connectors.models import InboundEvent
+            for i, (etype, when) in enumerate([
+                ("case.upserted", days_ago(0, 3)),
+                ("contact.logged", days_ago(0, 6)),
+                ("document.added", days_ago(1)),
+                ("client.upserted", days_ago(2)),
+            ]):
+                InboundEvent.objects_unscoped.create(
+                    firm=zlg, idempotency_key=f"seed-{i}", event_type=etype,
+                    source="pm", payload={"external_id": f"PM-{1000+i}"},
+                    status="applied", received_at=when, applied_at=when,
+                )
+
+            # Embeddings so semantic search works out of the box
+            for d in DocRecord.objects_unscoped.filter(firm=zlg):
+                d.embedding = ai.embed(f"{d.filename} {d.summary} {d.extracted_text}")
+                d.save(update_fields=["embedding"])
 
         # ------------------------------------------------------------------
         # Coastal (isolation proof): one client, one case

@@ -154,18 +154,82 @@ def doc_publish(request, doc_id):
 @api_view(["GET"])
 @permission_classes([IsFirmStaff])
 def search(request):
-    """Keyword search across published docs (pgvector semantic search later)."""
+    """Semantic search across published + in-review docs. Embeds the query and
+    ranks by cosine against each doc's stored embedding; falls back to keyword
+    matching for anything without an embedding."""
+    from casebridge import ai
+
     q = (request.GET.get("q") or "").strip()
     if not q:
-        return Response({"results": []})
-    docs = DocRecord.objects.select_related("case", "case__client").filter(
-        status="published"
+        return Response({"results": [], "mode": "semantic" if ai.is_enabled() else "lexical"})
+
+    docs = list(
+        DocRecord.objects.select_related("case", "case__client").exclude(status="queued")
     )
-    results = []
+    qvec = ai.embed(q)
+    ql = q.lower()
+    scored = []
     for d in docs:
-        haystack = f"{d.filename} {d.summary} {d.extracted_text}".lower()
-        if q.lower() in haystack:
-            idx = haystack.find(q.lower())
-            snippet = haystack[max(0, idx - 60) : idx + 120]
-            results.append({**_doc_json(d), "snippet": f"...{snippet}..."})
-    return Response({"results": results[:25]})
+        emb = d.embedding
+        if emb:
+            score = ai.cosine(qvec, emb)
+        else:
+            hay = f"{d.filename} {d.summary} {d.extracted_text}".lower()
+            score = 0.5 if ql in hay else 0.0
+        if score > 0.12:
+            snippet = (d.summary or d.extracted_text or "")[:180]
+            scored.append((score, {**_doc_json(d), "snippet": snippet, "score": round(score, 3)}))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return Response({
+        "results": [r for _, r in scored[:25]],
+        "mode": "semantic" if ai.is_enabled() else "lexical",
+    })
+
+
+@api_view(["POST"])
+@permission_classes([IsFirmStaff])
+def analyze_text(request):
+    """Run the real AI pipeline on pasted/uploaded document text: classify →
+    summarize → extract → embed, and persist a DocRecord tied to a case.
+    This is the live Smart Document Reader capability (uses OpenAI when keyed)."""
+    from casebridge import ai
+
+    from apps.cases.models import PortalCase
+
+    text = (request.data.get("text") or "").strip()
+    case_id = request.data.get("case_id")
+    filename = (request.data.get("filename") or "pasted-document.txt").strip()
+    if len(text) < 20:
+        return Response({"detail": "Provide at least a short paragraph of document text."}, status=400)
+    case = PortalCase.objects.filter(id=case_id).first() if case_id else PortalCase.objects.first()
+    if case is None:
+        return Response({"detail": "No case available to attach to."}, status=400)
+
+    cls = ai.classify_document(text)
+    summ = ai.summarize_document(text, cls["doc_type"])
+    facts = ai.extract_facts(text, cls["doc_type"])
+    emb = ai.embed(f"{summ['summary']} {text}")
+
+    doc = DocRecord.objects_unscoped.create(
+        firm_id=case.firm_id, case=case, filename=filename,
+        doc_type=cls["doc_type"], classification_confidence=cls["confidence"],
+        status="in_review", page_count=max(1, len(text) // 2500),
+        summary=summ["summary"], extracted_text=text[:20000],
+        embedding=emb, ai_processed=cls["ai"],
+    )
+    for f in facts["facts"]:
+        ExtractedFact.objects_unscoped.create(
+            firm_id=case.firm_id, doc=doc, fact_type=f["fact_type"], label=f["label"],
+            value=f["value"], confidence=f["confidence"], page_ref=f.get("page_ref", 1),
+        )
+    ValueEvent.objects_unscoped.create(
+        firm_id=case.firm_id, module="reader", event_type="doc_ai_analyzed",
+        actor_type="staff", metadata={"ai": cls["ai"], "doc_type": cls["doc_type"]},
+    )
+    return Response({
+        "doc_id": str(doc.id),
+        "ai_enabled": ai.is_enabled(),
+        "classification": cls,
+        "summary": summ["summary"],
+        "facts_extracted": len(facts["facts"]),
+    }, status=201)

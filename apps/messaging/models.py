@@ -43,8 +43,56 @@ class Message(TenantModel):
     read_by_client_at = models.DateTimeField(null=True, blank=True)
     read_by_staff_at = models.DateTimeField(null=True, blank=True)
 
+    # Sentiment (client messages only): scored by the AI service, flagged for
+    # manager review before a frustrated client becomes a review or grievance.
+    class Sentiment(models.TextChoices):
+        UNSCORED = "unscored"
+        POSITIVE = "positive"
+        NEUTRAL = "neutral"
+        NEGATIVE = "negative"
+
+    sentiment = models.CharField(max_length=10, choices=Sentiment.choices, default=Sentiment.UNSCORED)
+    sentiment_flagged = models.BooleanField(default=False)  # negative → needs review
+    sentiment_reviewed_at = models.DateTimeField(null=True, blank=True)
+
     class Meta:
         ordering = ["created_at"]
+
+
+class Delivery(TenantModel):
+    """Per-channel delivery record for an outbound message. In production the
+    provider (Twilio/SES) fills status + provider_message_id via webhook; here
+    it captures the multi-channel fan-out intent and consent gating."""
+
+    class Channel(models.TextChoices):
+        PORTAL = "portal"
+        EMAIL = "email"
+        SMS = "sms"
+
+    class Status(models.TextChoices):
+        QUEUED = "queued"
+        SENT = "sent"
+        DELIVERED = "delivered"
+        SKIPPED = "skipped"  # e.g. no consent
+        FAILED = "failed"
+
+    message = models.ForeignKey(Message, on_delete=models.CASCADE, related_name="deliveries")
+    channel = models.CharField(max_length=10, choices=Channel.choices)
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.QUEUED)
+    provider_message_id = models.CharField(max_length=120, blank=True)
+    detail = models.CharField(max_length=200, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+
+
+class ScheduledCheckIn(TenantModel):
+    """Cadence engine: the next automatic touchpoint for a case, regardless of
+    activity. The run_cadence command fires due check-ins and reschedules them."""
+
+    case = models.OneToOneField(PortalCase, on_delete=models.CASCADE, related_name="check_in")
+    cadence_days = models.PositiveIntegerField(default=14)
+    next_run_at = models.DateTimeField(default=timezone.now)
+    last_run_at = models.DateTimeField(null=True, blank=True)
+    active = models.BooleanField(default=True)
 
 
 class EscalationEvent(TenantModel):

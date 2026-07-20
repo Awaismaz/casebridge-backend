@@ -48,6 +48,8 @@ INSTALLED_APPS = [
     "apps.evidence",
     "apps.docintel",
     "apps.billing",
+    "apps.connectors",
+    "apps.engagement",
 ]
 
 MIDDLEWARE = [
@@ -168,3 +170,7 @@ if not DEBUG:
 
 # Demo mode: enables /api/v1/auth/demo/ persona logins against seeded data.
 DEMO_MODE = os.environ.get("DEMO_MODE", "true").lower() == "true"
+
+# AI features light up automatically when this is set (document intelligence,
+# semantic search, sentiment, narrative). Absent → deterministic fallbacks.
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")

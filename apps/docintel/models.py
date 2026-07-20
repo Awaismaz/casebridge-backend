@@ -39,6 +39,10 @@ class DocRecord(TenantModel):
     page_count = models.PositiveIntegerField(default=1)
     summary = models.TextField(blank=True)
     extracted_text = models.TextField(blank=True)
+    # Embedding of (summary + text) for semantic search. Stored as a JSON float
+    # list; cosine computed in Python at demo scale, pgvector for production scale.
+    embedding = models.JSONField(null=True, blank=True)
+    ai_processed = models.BooleanField(default=False)  # ran through the live pipeline
     created_at = models.DateTimeField(default=timezone.now)
     published_at = models.DateTimeField(null=True, blank=True)
 
@@ -100,3 +104,14 @@ class TimelineEntry(TenantModel):
 
     class Meta:
         ordering = ["date"]
+
+
+class CaseNarrative(TenantModel):
+    """Auto-generated running case log — a readable prose history assembled from
+    the timeline + published docs. Regenerated on demand (MVP)."""
+
+    case = models.OneToOneField(PortalCase, on_delete=models.CASCADE, related_name="narrative")
+    text = models.TextField(blank=True)
+    version = models.PositiveIntegerField(default=1)
+    generated_at = models.DateTimeField(null=True, blank=True)
+    ai_generated = models.BooleanField(default=False)
